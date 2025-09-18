@@ -1,0 +1,50 @@
+# 가상환경 / 캐시
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
+# 환경설정 / OS 특화 파일
+.env
+.env.*
+!.env.example
+*.DS_Store
+*.log
+*.lock
+
+# 빌드 도구 관련
+*.egg-info/
+.eggs/
+*.pytest_cache
+.coverage
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+.pyre/
+
+# 패키지 매니저
+node_modules/
+npm-debug.log
+yarn.lock
+pnpm-lock.yaml
+
+# 프론트엔드 소스
+flash-tickets-web/
+web/
+
+# 문서 / 설정
+README.md
+*.md
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+
+# IDE
+.vscode/
+.idea/
+*.swp
