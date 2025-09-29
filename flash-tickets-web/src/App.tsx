@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { CheckCircle2, CircleDot, CircleSlash, Coins, Send, Server, ShoppingCart, Webhook } from "lucide-react";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8080";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8080";
 
 function genIdem() { return "ui-" + Math.random().toString(36).slice(2, 12); }
 
@@ -33,26 +33,70 @@ export default function App() {
 
   function push(e: StockEvent) { setTimeline((prev) => [...prev.slice(-199), { ...e, ts: Date.now() }]); }
 
-  const connectWS = async () => {
+  const connectWS = () => {
     try {
-      setError(null); setConnecting(true); wsRef.current?.close();
-      // 프록시 경로(/api/ws) 사용—배포 시 Nginx 프록시, 로컬 개발은 .env로 직접 FastAPI에도 OK
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
+      setConnecting(true);
       const wsURL = new URL((API_BASE.startsWith("/") ? window.location.origin + API_BASE : API_BASE).replace(/^http/, "ws"));
       wsURL.pathname = (wsURL.pathname.replace(/\/$/, "") || "") + "/ws";
       wsURL.searchParams.set("eventId", eventId);
-      const ws = new WebSocket(wsURL.toString()); wsRef.current = ws;
-      ws.onopen = () => { setConnected(true); setConnecting(false); push({ type: "ws.open" }); };
-      ws.onclose = () => { setConnected(false); push({ type: "ws.close" }); };
-      ws.onerror = () => setError("WebSocket error");
-      ws.onmessage = (ev) => { try {
-          const data = JSON.parse(ev.data); push(data);
+      const ws = new WebSocket(wsURL.toString());
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setError(null);
+        setConnected(true);
+        setConnecting(false);
+        push({ type: "ws.open" });
+      };
+
+      ws.onclose = () => {
+        setConnected(false);
+        setConnecting(false);
+        // Automatically reconnect after a delay
+        setTimeout(connectWS, 2000);
+      };
+
+      ws.onerror = (err) => {
+        console.log("WebSocket connection failed, retrying...", err);
+        // No need to set a visible error message here, as reconnection is automatic
+        ws.close(); // This will trigger the onclose handler for reconnection
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          push(data);
           if (data.type === "stock.update") setStock({ remaining: data.remaining, sold: data.sold, inHold: data.inHold });
         } catch {}
       };
-    } catch (e: any) { setError(e?.message || "connect failed"); setConnecting(false); }
+    } catch (e: any) {
+      setError(e?.message || "connect failed");
+      setConnecting(false);
+    }
   };
-  const disconnectWS = () => wsRef.current?.close();
-  useEffect(() => { connectWS(); return () => wsRef.current?.close(); /* eslint-disable-next-line */ }, []);
+
+  const disconnectWS = () => {
+    if (wsRef.current) {
+      wsRef.current.onclose = null; // Prevent automatic reconnection
+      wsRef.current.close();
+      wsRef.current = null;
+      setConnected(false);
+      setConnecting(false);
+      push({ type: "ws.close" });
+    }
+  };
+
+  useEffect(() => {
+    connectWS();
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.onclose = null; // Prevent reconnection on component unmount
+        wsRef.current.close();
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const purchase = async () => {
     setError(null);
