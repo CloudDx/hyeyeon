@@ -1,0 +1,216 @@
+# 애플리케이션 워크플로우의 논블로킹 전환 비교
+
+이 문서는 현재의 동기적 워크플로우와 사용자가 제안한 비동기적(논블로킹) 워크플로우의 차이점을 설명합니다.
+
+## 1. 현재 방식: 동기적 워크플로우 (Synchronous Workflow)
+
+현재 프로젝트는 클라이언트의 요청에 대해 모든 처리를 완료한 후 응답하는, 일반적인 'Request-Response' 모델을 따릅니다.
+
+### 가. 아키텍처 다이어그램 (현재)
+
+```
++----------+        +---------------------------------+        +------------+
+| Client   | --(1)--> |           API Server            | --(2)--> | Database   |
+| (Browser)|          | (모든 로직 처리 완료까지 대기 ⏳) |          | (PostgreSQL)|
+|          | <--(4)-- |                                 | <--(3)-- |            |
++----------+        +---------------------------------+        +------------+
+```
+
+### 나. 작동 순서
+1.  **요청**: 클라이언트가 `POST /purchase` API를 호출하며 '구매' 요청을 보냅니다.
+2.  **처리 및 대기**: API 서버는 요청을 받고, 데이터베이스 Lock, 재고 확인, 주문 생성 등 모든 비즈니스 로직을 **그 자리에서 순차적으로 모두 실행**합니다.
+3.  **DB 응답**: 데이터베이스가 결과를 반환합니다.
+4.  **최종 응답**: 모든 처리가 성공적으로 끝나면, 서버는 클라이언트에게 `HTTP 200 OK`와 함께 처리 결과(주문 정보 등)를 응답합니다. 클라이언트는 이 응답을 받을 때까지 기다립니다.
+
+- **장점**: 구현이 직관적이고 간단합니다. 작업이 금방 끝나는 경우에 효과적입니다.
+- **단점**: 구매 처리 로직이 복잡해지거나 외부 시스템(결제 등) 호출로 인해 느려지면, 클라이언트가 응답을 기다리는 시간이 길어져 사용자 경험(UX)이 저하됩니다.
+
+---
+
+## 2. 제안 방식: 비동기적 워크플로우 (Asynchronous Workflow)
+
+사용자가 제안한 방식은, 요청을 받는 부분과 실제 로직을 처리하는 부분을 분리하여 클라이언트가 즉시 응답을 받게 하는 'Background Task' 모델입니다.
+
+### 가. 아키텍처 다이어그램 (변경 후)
+
+```
++----------+      +----------------+      +-----------------+
+| Client   |-(1)->|   API Server   |-(2)->|   Task Queue    |
+| (Browser)|      | (즉시 202 응답)|      | (e.g., RabbitMQ) |
+|          |<-(*)--|                |      +-----------------+
++----------+      +----------------+             | (3)
+     ^                                         v
+     |                               +-------------------+
+     |                               | Background Worker |
+     +---------(5)-------------------|  (e.g., Celery)   |
+       (WebSocket)                   +-------------------+
+                                             | (4)
+                                             v
+                                        +------------+
+                                        | Database   |
+                                        +------------+
+```
+
+### 나. 작동 순서
+1.  **요청**: 클라이언트가 `POST /purchase` API를 호출합니다.
+2.  **접수 및 즉시 응답**: API 서버는 요청의 유효성만 간단히 확인한 뒤, 처리해야 할 작업을 **Task Queue(작업 대기열)**에 넣고, 클라이언트에게는 "요청을 잘 접수했으며, 처리되면 알려주겠다"는 의미의 `HTTP 202 Accepted`를 **즉시 응답**합니다. 클라이언트는 이제 다른 작업을 할 수 있습니다.
+3.  **작업 전달**: Task Queue에 들어온 작업을 별도의 **Background Worker(백그라운드 일꾼)** 프로세스가 가져갑니다.
+4.  **백그라운드 처리**: Worker가 실제 비즈니스 로직(DB Lock, 재고 확인, 주문 생성 등)을 모두 수행합니다.
+5.  **결과 통보**: Worker는 작업이 끝나면, 그 결과를 **웹소켓**을 통해 클라이언트에게 통보합니다. (예: `order_status: 'HOLD'`). 클라이언트는 이 메시지를 받아 UI를 최종적으로 업데이트합니다.
+
+---
+
+## 3. 장단점 비교 및 결론
+
+| 구분 | 현재 (동기적 워크플로우) | 제안 (비동기적 워크플로우) |
+| :--- | :--- | :--- |
+| **사용자 경험** | 처리가 길어지면 UI가 멈춘 것처럼 보임 | 즉시 응답을 받아 UI 멈춤이 없음 (체감 성능 향상) |
+| **아키텍처 복잡도** | 간단함 | Task Queue, Worker 등 관리 요소가 늘어나 복잡함 |
+| **안정성** | 로직 처리 중 오류 시, 요청 자체가 실패 | API 서버와 Worker가 분리되어 안정적. 실패한 작업 재시도 용이 |
+| **결과 확인** | HTTP 응답으로 바로 결과를 알 수 있음 | 웹소켓 등 별도 채널로 결과를 비동기적으로 받아야 함 |
+
+### 결론
+
+말씀하신 "애플리케이션 딴에서의 논블로킹" 방식은 매우 현대적이고 확장성 높은 아키텍처입니다. 티켓 구매처럼 처리가 매우 빠를 것으로 예상되는 작업에는 현재의 간단한 동기적 워크플로우도 충분하지만, 만약 **결제사 연동, 쿠폰 적용, 알림 발송 등 복잡하고 시간이 걸리는 작업이 추가된다면 제안하신 비동기적 워크플로우 방식이 훨씬 더 안정적이고 뛰어난 사용자 경험을 제공**할 것입니다.
+
+---
+
+## 4. 구현: `pika`를 `aio-pika`로 전환하여 비동기 문제 해결
+
+현재 발생하는 `missed heartbeats` 오류는 동기 라이브러리 `pika`가 비동기 프레임워크 FastAPI의 이벤트 루프를 차단하기 때문에 발생합니다. 이를 해결하기 위해 비동기 전용 라이브러리 `aio-pika`를 도입합니다.
+
+### 가. 의존성 추가 (`requirements.txt`)
+
+먼저, `aio-pika` 라이브러리를 프로젝트 의존성에 추가합니다.
+
+```diff
++ aio-pika
+  fastapi
+  # ... existing dependencies
+```
+
+### 나. 코드 수정 (`app/main.py`)
+
+`app/main.py` 파일의 RabbitMQ 관련 로직을 다음과 같이 비동기 코드로 전면 수정합니다.
+
+#### 1. Import 구문 변경
+
+`pika` 대신 `aio_pika`를 import하고, 관련 타입 힌트를 추가합니다.
+
+```python
+# 기존
+import pika
+
+# 변경
+import aio_pika
+from aio_pika.abc import AbstractRobustConnection, AbstractRobustChannel
+```
+
+#### 2. 전역 변수 및 타입 힌트 수정
+
+`pika` 객체 대신 `aio_pika`의 비동기 연결 및 채널 객체를 사용하도록 전역 변수와 타입 힌트를 변경합니다.
+
+```python
+# 기존
+pika_connection = None
+pika_channel = None
+
+# 변경
+rabbitmq_connection: AbstractRobustConnection | None = None
+rabbitmq_channel: AbstractRobustChannel | None = None
+```
+
+#### 3. RabbitMQ 연결 함수 비동기화 (`connect_rabbitmq`)
+
+`connect_rabbitmq` 함수를 `async` 함수로 변경하고, `aio_pika.connect_robust`를 사용하여 비동기적으로 연결합니다. `connect_robust`는 연결이 끊어지면 자동으로 재연결을 시도하므로 재시도 로직을 직접 구현할 필요가 없습니다.
+
+```python
+# 기존 (동기 함수)
+def connect_rabbitmq():
+    # ... pika.BlockingConnection 사용 및 while 루프 재시도 ...
+
+# 변경 (비동기 함수)
+async def connect_rabbitmq():
+    global rabbitmq_connection, rabbitmq_channel
+    rabbitmq_host = os.getenv('''RABBITMQ_HOST''', '''rabbitmq''')
+    
+    try:
+        # 비동기 연결 및 자동 재연결 설정
+        connection = await aio_pika.connect_robust(host=rabbitmq_host)
+        
+        # 채널 생성
+        channel = await connection.channel()
+        
+        # 큐 선언
+        await channel.queue_declare('''hello''')
+        
+        rabbitmq_connection = connection
+        rabbitmq_channel = channel
+        log_json(event="rabbitmq_connect", status="success")
+
+    except Exception as e:
+        log_json(level="error", msg="rabbitmq_connect_failed", error=str(e))
+        # 애플리케이션 시작 시 연결 실패는 심각한 문제이므로 예외 발생
+        raise RuntimeError("Failed to connect to RabbitMQ") from e
+```
+
+#### 4. `send_message` 함수 비동기화
+
+`send_message` 함수에서 `aio-pika` 채널을 사용하여 비동기적으로 메시지를 발행합니다. 더 이상 재연결 로직을 직접 호출할 필요가 없습니다.
+
+```python
+# 기존
+@app.post("/send-message")
+async def send_message(payload: Message):
+    # ... pika_channel 사용 및 재연결 로직 ...
+    pika_channel.basic_publish(...)
+
+# 변경
+@app.post("/send-message")
+async def send_message(payload: Message):
+    global rabbitmq_channel
+    if not rabbitmq_channel:
+        raise HTTPException(status_code=503, detail="RabbitMQ service not available")
+    
+    try:
+        # 비동기 메시지 발행
+        await rabbitmq_channel.default_exchange.publish(
+            aio_pika.Message(body=payload.message.encode('''utf-8''')),
+            routing_key='''hello'''
+        )
+        log_json(event="send_message", message=payload.message)
+        return {"status": "message sent", "message": payload.message}
+    except Exception as e:
+        log_json(level="error", msg="send_message_error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to send message: {e}")
+```
+
+#### 5. 애플리케이션 시작/종료 이벤트 수정
+
+`on_start`와 `on_shutdown` 이벤트 핸들러가 비동기화된 연결/종료 함수를 `await` 하도록 수정합니다.
+
+```python
+# 기존
+@app.on_event("startup")
+async def on_start():
+    asyncio.create_task(expire_task())
+    connect_rabbitmq() # 동기 호출
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    if pika_connection and pika_connection.is_open:
+        pika_connection.close()
+
+# 변경
+@app.on_event("startup")
+async def on_start():
+    asyncio.create_task(expire_task())
+    await connect_rabbitmq() # 비동기 호출
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global rabbitmq_connection
+    if rabbitmq_connection and not rabbitmq_connection.is_closed:
+        await rabbitmq_connection.close()
+        log_json(event="rabbitmq_shutdown", status="connection closed")
+```

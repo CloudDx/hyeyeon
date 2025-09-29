@@ -1,9 +1,12 @@
-import asyncio, os, uuid, time
+import asyncio, os, uuid, time, json
+import aio_pika
+from aio_pika.abc import AbstractRobustConnection, AbstractRobustChannel, AbstractIncomingMessage
 from datetime import datetime, timedelta, timezone
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Depends, HTTPException, Header, WebSocket, WebSocketDisconnect, Response, Query
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,18 +19,17 @@ from .utils import log_json
 
 app = FastAPI(title="Flash Tickets (FastAPI)")
 
-# ▼ 추가: Vite(5173)에서 오는 프리플라이트/본요청 모두 허용
+rabbitmq_connection: AbstractRobustConnection | None = None
+rabbitmq_channel: AbstractRobustChannel | None = None
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*",
-    ],
-    allow_credentials=True,   # 쿠키/인증 필요 없으면 False로 바꿔도 됨
-    allow_methods=["*"],      # 프리플라이트에서 확인하는 메서드 전부 허용
-    allow_headers=["Idempotency-Key"],      # 커스텀 헤더(Idempotency-Key 등) 허용
+    allow_origins=["*",],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["Idempotency-Key"],
 )
 
-# --- simple in-memory WS broadcast manager ---
 class WSManager:
     def __init__(self):
         self.active: set[WebSocket] = set()
@@ -59,7 +61,6 @@ class WSManager:
 manager = WSManager()
 
 async def current_remaining(sess: AsyncSession, event_id: str) -> tuple[int,int,int]:
-    # get total/sold and inHold (non-expired)
     q = text("""
         WITH hold AS (
             SELECT COALESCE(SUM(qty),0) AS in_hold
@@ -80,12 +81,11 @@ async def healthz(db: bool | None = Query(default=False), session: AsyncSession 
         await session.execute(text("SELECT 1"))
     return "ok"
 
-@app.get("/metrics")
+@app.get("/metrics", response_model=None)
 async def metrics():
     ct, data = metrics_response()
     return Response(content=data, media_type=ct)
 
-# --- PURCHASE ---
 @app.post("/purchase", response_model=PurchaseOut)
 async def purchase(
     payload: PurchaseIn,
@@ -101,9 +101,7 @@ async def purchase(
     order_id = "ord_" + uuid.uuid4().hex[:10]
     hold_id = "hold_" + uuid.uuid4().hex[:10]
 
-    # ✅ 트랜잭션을 딱 한 번만 연다 (이 안에 멱등체크/락/INSERT 모두)
     async with session.begin():
-        # 1) 멱등체크 (이미 존재하면 그대로 반환)
         q = select(Order).where(
             Order.event_id == event_id,
             Order.idempotency_key == Idempotency_Key,
@@ -112,22 +110,18 @@ async def purchase(
         ex = res.scalars().first()
         if ex:
             purchase_attempts_total.labels(result="idempotent").inc()
-            # remaining 계산은 별도 함수 사용 (SELECT만 수행)
             remaining, _, _ = await current_remaining(session, event_id)
             return PurchaseOut(orderId=ex.id, status=ex.status, remaining=remaining, holdExpiresAt=None)
 
-        # 2) 이벤트 행 잠금 (원자적 차감 준비)
         wait_start = time.perf_counter()
         await session.execute(text("SELECT 1 FROM events WHERE id=:eid FOR UPDATE"), {"eid": event_id})
         pg_locks_wait_seconds.observe(time.perf_counter() - wait_start)
 
-        # 3) 잔여 수량 확인
         remaining, sold, in_hold = await current_remaining(session, event_id)
         if remaining < qty:
             purchase_attempts_total.labels(result="out_of_stock").inc()
             raise HTTPException(status_code=409, detail="OUT_OF_STOCK")
 
-        # 4) 주문 + 홀드 INSERT
         await session.execute(
             text("""
                 INSERT INTO orders(id, user_id, event_id, status, qty, idempotency_key)
@@ -151,7 +145,6 @@ async def purchase(
             {"hid": hold_id, "eid": event_id, "uid": "user_demo", "qty": qty, "exp": expires},
         )
 
-    # 트랜잭션 COMMIT 이후 브로드캐스트
     purchase_attempts_total.labels(result="hold").inc()
     purchase_duration_seconds.observe(time.perf_counter() - start)
 
@@ -163,45 +156,52 @@ async def purchase(
 
 @app.post("/pay/{order_id}", response_model=PayOut)
 async def pay(order_id: str, session: AsyncSession = Depends(get_session)):
-    async with session.begin():
-        # get order
-        r = await session.execute(text("SELECT event_id, qty, status FROM orders WHERE id=:oid FOR UPDATE"), {"oid": order_id})
-        row = r.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="order not found")
-        event_id, qty, status = row
-        if status == OrderStatus.PAID.value:
-            return PayOut(ok=True, status="PAID")
-        if status not in (OrderStatus.HOLD.value, OrderStatus.INIT.value):
-            raise HTTPException(status_code=409, detail=f"invalid status {status}")
+    # 확인용 로그
+    # log_json(event="pay_endpoint_triggered", order_id=order_id)
+    # 1. Get order details
+    r = await session.execute(text("SELECT event_id, qty, status FROM orders WHERE id=:oid"), {"oid": order_id})
+    row = r.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="order not found")
+    event_id, qty, status = row
 
-        # set PAID and increase sold_qty
-        await session.execute(text("UPDATE orders SET status='PAID' WHERE id=:oid"), {"oid": order_id})
-        await session.execute(text("UPDATE events SET sold_qty = sold_qty + :qty WHERE id=:eid"), {"qty": qty, "eid": event_id})
-        # remove corresponding holds
-        await session.execute(text("DELETE FROM holds WHERE event_id=:eid AND user_id='user_demo'"), {"eid": event_id})
+    if status == OrderStatus.PAID.value:
+        return PayOut(ok=True, status="PAID")
+    if status not in (OrderStatus.HOLD.value, OrderStatus.INIT.value):
+        raise HTTPException(status_code=409, detail=f"invalid status {status}")
 
-    # broadcast
-    rem, sold, in_hold = await current_remaining(session, event_id)
-    await manager.broadcast({"type":"stock.update","remaining":rem,"sold":sold,"inHold":in_hold})
-    await manager.broadcast({"type":"order.update","orderId":order_id,"status":"PAID"})
-    log_json(event="pay", orderId=order_id, result="PAID", remaining=rem)
-    return PayOut(ok=True, status="PAID")
+    # 2. Publish payment request message
+    if not rabbitmq_channel:
+        raise HTTPException(status_code=503, detail="RabbitMQ service not available")
+
+    message_body = {
+        "order_id": order_id,
+        "event_id": event_id,
+        "qty": qty
+    }
+    try:
+        await rabbitmq_channel.default_exchange.publish(
+            aio_pika.Message(body=json.dumps(message_body).encode('utf-8')),
+            routing_key='payment_request_queue'
+        )
+        log_json(event="payment_request_published", order_id=order_id)
+        return PayOut(ok=True, status="PAYMENT_PROCESSING")
+    except Exception as e:
+        log_json(level="error", msg="payment_request_publish_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to publish payment request: {e}")
 
 @app.websocket("/ws")
 async def ws(ws: WebSocket, eventId: str):
     await manager.connect(ws)
     try:
-        # send initial snapshot
         async with SessionLocal() as session:
             rem, sold, in_hold = await current_remaining(session, eventId)
         await ws.send_json({"type":"stock.update","remaining":rem,"sold":sold,"inHold":in_hold})
         ws_messages_total.labels(direction="send", type="stock.update").inc()
 
         while True:
-            msg = await ws.receive_text()
+            await ws.receive_text()
             ws_messages_total.labels(direction="recv", type="client").inc()
-            # simple echo ack
             await ws.send_json({"type":"ack"})
             ws_messages_total.labels(direction="send", type="ack").inc()
     except WebSocketDisconnect:
@@ -209,7 +209,6 @@ async def ws(ws: WebSocket, eventId: str):
     finally:
         await manager.disconnect(ws)
 
-# --- background task: expire holds periodically ---
 async def expire_task():
     while True:
         try:
@@ -229,6 +228,82 @@ async def expire_task():
             log_json(level="error", msg="expire_task_error", error=str(e))
             await asyncio.sleep(5)
 
+async def on_payment_result(message: AbstractIncomingMessage):
+    # 확인용 로그
+    # log_json(event="on_payment_result_triggered")
+    async with message.process():
+        try:
+            data = json.loads(message.body.decode('utf-8'))
+            order_id = data.get("order_id")
+            status = data.get("status")
+            event_id = data.get("event_id")
+
+            if status == "PAID":
+                log_json(event="payment_result_received", order_id=order_id, result="PAID")
+                async with SessionLocal() as session:
+                    rem, sold, in_hold = await current_remaining(session, event_id)
+                await manager.broadcast({"type":"stock.update","remaining":rem,"sold":sold,"inHold":in_hold})
+                await manager.broadcast({"type":"order.update","orderId":order_id,"status":"PAID"})
+            else:
+                log_json(event="payment_result_received", order_id=order_id, result="FAILED")
+                # Optionally, handle failed payments (e.g., notify user)
+
+        except Exception as e:
+            log_json(level="error", msg="payment_result_processing_failed", error=str(e))
+
+async def consume_payment_results():
+    if not rabbitmq_channel:
+        log_json(level="error", msg="cannot_consume_results_no_channel")
+        return
+    queue = await rabbitmq_channel.get_queue('payment_result_queue')
+    await queue.consume(on_payment_result)
+    log_json(event="consumer_started", queue="payment_result_queue")
+
+async def connect_rabbitmq():
+    global rabbitmq_connection, rabbitmq_channel
+    rabbitmq_host = os.getenv('RABBITMQ_HOST', 'rabbitmq')
+    
+    for i in range(10):
+        try:
+            log_json(event="rabbitmq_connect", status="attempting", count=i)
+            connection = await aio_pika.connect_robust(host=rabbitmq_host, timeout=5)
+            rabbitmq_connection = connection
+            log_json(event="rabbitmq_connect", status="success")
+            
+            rabbitmq_channel = await rabbitmq_connection.channel()
+            log_json(event="rabbitmq_channel_get", status="success")
+
+            await rabbitmq_channel.declare_queue('payment_request_queue', durable=True)
+            log_json(event="rabbitmq_queue_declare", status="success", queue='payment_request_queue')
+            
+            await rabbitmq_channel.declare_queue('payment_result_queue', durable=True)
+            log_json(event="rabbitmq_queue_declare", status="success", queue='payment_result_queue')
+
+            break
+        except Exception as e:
+            log_json(level="warning", msg="rabbitmq_connect_failed_retrying", error=str(e), attempt=i)
+            await asyncio.sleep(5)
+    else:
+        log_json(level="error", msg="rabbitmq_connect_failed_gave_up")
+        raise RuntimeError("Failed to connect to RabbitMQ after several retries.")
+
+async def consume_payment_results():
+    if not rabbitmq_channel:
+        log_json(level="error", msg="cannot_consume_results_no_channel")
+        return
+    queue = await rabbitmq_channel.get_queue('payment_result_queue')
+    await queue.consume(on_payment_result)
+    log_json(event="consumer_started", queue="payment_result_queue")
+
 @app.on_event("startup")
 async def on_start():
     asyncio.create_task(expire_task())
+    await connect_rabbitmq()
+    asyncio.create_task(consume_payment_results())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global rabbitmq_connection
+    if rabbitmq_connection and not rabbitmq_connection.is_closed:
+        await rabbitmq_connection.close()
+        log_json(event="rabbitmq_shutdown", status="connection closed")

@@ -1,22 +1,39 @@
-version: "3.9"
-
 services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: flash-tickets-rabbitmq
+    ports:
+      - "5672:5672"  # AMQP protocol port
+      - "15672:15672" # Management UI port
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  consumer:
+    build: .
+    container_name: flash-tickets-consumer
+    command: python -u app/consumer.py
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
   api:
     build: .
     container_name: flash-tickets-api
     env_file:
       - .env
     environment:
-      # compose 네트워크 내부에선 서비스명으로 접속
-      # 예시 값: postgresql+asyncpg://app:app@postgres:5432/appdb
-      # (아래 postgres 서비스의 USER/PASSWORD/DB와 맞춰주세요)
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://app:app@postgres:5432/appdb}
       UVICORN_HOST: 0.0.0.0
       UVICORN_PORT: 8080
     ports:
-      - "8080:8080"   # 호스트에서 http://localhost:8080
+      - "8080:8080"
     depends_on:
       postgres:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
@@ -24,7 +41,31 @@ services:
       timeout: 3s
       retries: 10
     command: >
-      sh -lc "uvicorn app.main:app --host ${UVICORN_HOST:-0.0.0.0} --port ${UVICORN_PORT:-8080}"
+      sh -c "python -m app.init_db && uvicorn app.main:app --loop asyncio --host ${UVICORN_HOST:-0.0.0.0} --port ${UVICORN_PORT:-8080}"
+
+  payment-service:
+    build:
+      context: ./payment_service
+    container_name: flash-tickets-payment-service
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://app:app@postgres:5432/appdb}
+      RABBITMQ_HOST: rabbitmq
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    command: >
+      sh -c "uvicorn payment_service.main:app --host 0.0.0.0 --port 8081"
 
   postgres:
     image: postgres:16
@@ -35,10 +76,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-appdb}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # 초기 스키마/데이터가 필요하면 ./db/init.sql 준비 후 아래 라인 주석 해제
-      # - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      - "5544:5432" # 호스트 5544 → 컨테이너 5432 (요청 반영)
+      - "5544:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-appdb} -h 127.0.0.1 -p 5432"]
       interval: 5s
