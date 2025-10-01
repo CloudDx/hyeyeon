@@ -28,6 +28,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://app:app@postgres:5432/appdb}
       UVICORN_HOST: 0.0.0.0
       UVICORN_PORT: 8080
+      AWS_XRAY_DAEMON_ADDRESS: xray-daemon:2000
     ports:
       - "8080:8080"
     depends_on:
@@ -35,6 +36,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      xray-daemon:
+        condition: service_started
     command: >
       sh -c "python -m app.init_db && uvicorn app.main:app --loop asyncio --host ${UVICORN_HOST:-0.0.0.0} --port ${UVICORN_PORT:-8080}"
 
@@ -47,6 +50,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://app:app@postgres:5432/appdb}
       RABBITMQ_HOST: rabbitmq
+      AWS_XRAY_DAEMON_ADDRESS: xray-daemon:2000
     ports:
       - "8081:8081"
     depends_on:
@@ -54,6 +58,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      xray-daemon:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/healthz || exit 1"]
       interval: 10s
@@ -78,6 +84,19 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  xray-daemon:
+    image: amazon/aws-xray-daemon:3.x
+    container_name: flash-tickets-xray-daemon
+    ports:
+      - "2000:2000/udp"
+      - "2000:2000/tcp"
+    command: ["-o", "--bind", ":2000"]
+    # For local testing with AWS, uncomment the following lines and add credentials to your .env file
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION:-ap-northeast-2}
 
 networks:
   default:
