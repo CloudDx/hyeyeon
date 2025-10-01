@@ -11,14 +11,6 @@ services:
       timeout: 3s
       retries: 20
 
-  consumer:
-    build: .
-    container_name: flash-tickets-consumer
-    command: python -u app/consumer.py
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-
   api:
     build: .
     container_name: flash-tickets-api

@@ -30,12 +30,16 @@ app.add_middleware(BaseHTTPMiddleware, dispatch=xray_middleware)
 rabbitmq_connection: AbstractRobustConnection | None = None
 rabbitmq_channel: AbstractRobustChannel | None = None
 
+# 프로덕션 배포 시 실제 프론트엔드 도메인으로 교체
+PROD_ORIGINS = ["https://gpdus4605.site", "https://www.gpdus4605.site"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*",],
+    # 로컬 개발 환경과 프로덕션 환경의 Origin을 모두 허용
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"] + PROD_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["Idempotency-Key"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Idempotency-Key", "Content-Type"],
 )
 
 class WSManager:
