@@ -93,10 +93,10 @@ services:
       - "2000:2000/tcp"
     command: ["-o", "--bind", ":2000"]
     # For local testing with AWS, uncomment the following lines and add credentials to your .env file
-    environment:
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION:-ap-northeast-2}
+    # environment:
+    #   - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    #   - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    #   - AWS_REGION=${AWS_REGION:-ap-northeast-2}
 
 networks:
   default:
