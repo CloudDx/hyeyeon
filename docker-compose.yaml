@@ -91,7 +91,7 @@ services:
     ports:
       - "2000:2000/udp"
       - "2000:2000/tcp"
-    command: ["-o", "--bind", ":2000"]
+    command: ["--bind", ":2000"]
     # For local testing with AWS, uncomment the following lines and add credentials to your .env file
     # environment:
     #   - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
