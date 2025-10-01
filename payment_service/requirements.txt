@@ -5,3 +5,4 @@ SQLAlchemy
 psycopg2-binary
 asyncpg
 pydantic-settings
+aws-xray-sdk==2.12.0

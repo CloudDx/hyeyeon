@@ -5,6 +5,9 @@ from aio_pika.abc import AbstractRobustConnection, AbstractRobustChannel, Abstra
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.ext.fastapi.middleware import XRayMiddleware
+
 from .config import settings
 from .database import SessionLocal
 from .models import OrderStatus
@@ -14,6 +17,9 @@ def log_json(level="info", **kwargs):
     print(json.dumps({"level": level, **kwargs}), flush=True)
 
 app = FastAPI(title="Payment Service")
+
+xray_recorder.configure(service='payment-service')
+app.add_middleware(XRayMiddleware)
 
 rabbitmq_connection: AbstractRobustConnection | None = None
 rabbitmq_channel: AbstractRobustChannel | None = None

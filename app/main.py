@@ -10,6 +10,9 @@ from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.ext.fastapi.middleware import XRayMiddleware
+
 from .config import settings
 from .db import get_session, SessionLocal
 from .models import Event, Order, Hold, OrderStatus
@@ -18,6 +21,9 @@ from .metrics import ws_connections, ws_messages_total, purchase_attempts_total,
 from .utils import log_json
 
 app = FastAPI(title="Flash Tickets (FastAPI)")
+
+xray_recorder.configure(service='flash-ticket-backend')
+app.add_middleware(XRayMiddleware)
 
 rabbitmq_connection: AbstractRobustConnection | None = None
 rabbitmq_channel: AbstractRobustChannel | None = None
