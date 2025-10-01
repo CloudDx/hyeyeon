@@ -6,7 +6,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aws_xray_sdk.core import xray_recorder
-from aws_xray_sdk.ext.fastapi.middleware import XRayMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from xraysink.asgi.middleware import xray_middleware
+from aws_xray_sdk.core.async_context import AsyncContext
 
 from .config import settings
 from .database import SessionLocal
@@ -18,8 +20,8 @@ def log_json(level="info", **kwargs):
 
 app = FastAPI(title="Payment Service")
 
-xray_recorder.configure(service='payment-service')
-app.add_middleware(XRayMiddleware)
+xray_recorder.configure(service='payment-service', context=AsyncContext())
+app.add_middleware(BaseHTTPMiddleware, dispatch=xray_middleware)
 
 rabbitmq_connection: AbstractRobustConnection | None = None
 rabbitmq_channel: AbstractRobustChannel | None = None

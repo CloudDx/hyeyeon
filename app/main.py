@@ -11,7 +11,9 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aws_xray_sdk.core import xray_recorder
-from aws_xray_sdk.ext.fastapi.middleware import XRayMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from xraysink.asgi.middleware import xray_middleware
+from aws_xray_sdk.core.async_context import AsyncContext
 
 from .config import settings
 from .db import get_session, SessionLocal
@@ -22,8 +24,8 @@ from .utils import log_json
 
 app = FastAPI(title="Flash Tickets (FastAPI)")
 
-xray_recorder.configure(service='flash-ticket-backend')
-app.add_middleware(XRayMiddleware)
+xray_recorder.configure(service='flash-ticket-backend', context=AsyncContext())
+app.add_middleware(BaseHTTPMiddleware, dispatch=xray_middleware)
 
 rabbitmq_connection: AbstractRobustConnection | None = None
 rabbitmq_channel: AbstractRobustChannel | None = None
